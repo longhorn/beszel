@@ -424,6 +424,19 @@ func TestMergeDeviceListsPreservesVerification(t *testing.T) {
 	assert.Equal(t, "sat+megaraid", device.Type)
 }
 
+func TestMergeDeviceListsPreservesSmartUnsupported(t *testing.T) {
+	existing := []*DeviceInfo{{Name: "/dev/sdd", smartUnsupported: true}}
+	scanned := []*DeviceInfo{{Name: "/dev/sdd", Type: "scsi"}}
+
+	merged := mergeDeviceLists(existing, scanned, nil)
+	require.Len(t, merged, 1)
+	assert.True(t, merged[0].smartUnsupported)
+
+	// Device disappears and comes back: flag must reset.
+	merged = mergeDeviceLists(nil, scanned, nil)
+	assert.False(t, merged[0].smartUnsupported)
+}
+
 func TestMergeDeviceListsUpdatesTypeWhenUnverified(t *testing.T) {
 	existing := []*DeviceInfo{
 		{Name: "/dev/sda", Type: "sat", parserType: "sat", typeVerified: false},
@@ -779,4 +792,26 @@ func TestFilterExcludedDevices(t *testing.T) {
 			assert.Equal(t, tt.expectedDevs, result)
 		})
 	}
+}
+
+func TestCollectSmart_ExitStatus2MarksUnsupported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub")
+	}
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	bin := filepath.Join(dir, "smartctl")
+	require.NoError(t, os.WriteFile(bin,
+		fmt.Appendf(nil, "#!/bin/sh\necho x >> %q\nexit 2\n", calls), 0o755))
+
+	sm := &SmartManager{SmartDataMap: map[string]*smart.SmartData{}, binPath: bin}
+	dev := &DeviceInfo{Name: "/dev/sdd"}
+
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, sm.CollectSmart(dev), &exitErr)
+	assert.True(t, dev.smartUnsupported)
+
+	assert.ErrorIs(t, sm.CollectSmart(dev), errNoValidSmartData)
+	out, _ := os.ReadFile(calls)
+	assert.Equal(t, 2, strings.Count(string(out), "x"))
 }

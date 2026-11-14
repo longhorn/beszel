@@ -51,9 +51,17 @@ type DeviceInfo struct {
 	typeVerified bool
 	// parserType holds the parser type (nvme, sat, scsi) that last succeeded.
 	parserType string
+	// smartUnsupported is set when smartctl exits with status 2 (no SMART support);
+	// the device is skipped until it disappears from a scan.
+	smartUnsupported bool
 }
 
 var errNoValidSmartData = fmt.Errorf("no valid SMART data found") // Error for missing data
+
+// IsSmartUnsupported reports whether the device was detected as lacking SMART support.
+func (d *DeviceInfo) IsSmartUnsupported() bool {
+	return d != nil && d.smartUnsupported
+}
 
 // Refresh updates SMART data for all known devices
 func (sm *SmartManager) Refresh(forceScan bool) error {
@@ -436,7 +444,7 @@ func (sm *SmartManager) parseSmartOutput(deviceInfo *DeviceInfo, output []byte) 
 // Uses -n standby to avoid waking up sleeping disks, but bypasses standby mode
 // for initial data collection when no cached data exists
 func (sm *SmartManager) CollectSmart(deviceInfo *DeviceInfo) error {
-	if deviceInfo != nil && sm.isExcludedDevice(deviceInfo.Name) {
+	if deviceInfo == nil || deviceInfo.smartUnsupported || sm.isExcludedDevice(deviceInfo.Name) {
 		return errNoValidSmartData
 	}
 
@@ -470,6 +478,12 @@ func (sm *SmartManager) CollectSmart(deviceInfo *DeviceInfo) error {
 	hasValidData := sm.parseSmartOutput(deviceInfo, output)
 
 	if !hasValidData {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
+			deviceInfo.smartUnsupported = true
+			slog.Info("smart not supported, skipping device", "device", deviceInfo.Name, "err", err)
+			return err
+		}
 		if err != nil {
 			slog.Info("smartctl failed", "device", deviceInfo.Name, "err", err)
 			return err
@@ -555,11 +569,15 @@ func mergeDeviceLists(existing, scanned, configured []*DeviceInfo) []*DeviceInfo
 		return existing
 	}
 
-	// preserveVerifiedType copies the verified type/parser metadata from an existing
-	// device record so that subsequent scans/config updates never downgrade a
-	// previously verified device.
+	// preserveVerifiedType copies the verified type/parser metadata and the
+	// smartUnsupported flag from an existing device record so that subsequent
+	// scans/config updates never downgrade a previously verified device.
 	preserveVerifiedType := func(target, prev *DeviceInfo) {
-		if prev == nil || !prev.typeVerified {
+		if prev == nil {
+			return
+		}
+		target.smartUnsupported = prev.smartUnsupported
+		if !prev.typeVerified {
 			return
 		}
 		target.Type = prev.Type
@@ -617,6 +635,9 @@ func mergeDeviceLists(existing, scanned, configured []*DeviceInfo) []*DeviceInfo
 			}
 			if dev.Protocol != "" {
 				existingDev.Protocol = dev.Protocol
+			}
+			if dev.smartUnsupported {
+				existingDev.smartUnsupported = true
 			}
 			continue
 		}
